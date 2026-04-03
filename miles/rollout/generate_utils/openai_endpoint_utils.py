@@ -2,6 +2,7 @@
 Utilities for the OpenAI endpoint
 """
 
+import asyncio
 import logging
 from argparse import Namespace
 from copy import deepcopy
@@ -12,6 +13,8 @@ from miles.utils.http_utils import post
 from miles.utils.types import Sample
 
 logger = logging.getLogger(__name__)
+
+_SESSION_REQUEST_TIMEOUT = 120
 
 
 class OpenAIEndpointTracer:
@@ -36,7 +39,24 @@ class OpenAIEndpointTracer:
 
     async def collect_records(self) -> tuple[list[SessionRecord], dict]:
         try:
-            response = await post(f"{self.router_url}/sessions/{self.session_id}", {}, action="get")
+            response = await asyncio.wait_for(
+                post(self.base_url, {}, action="get"),
+                timeout=_SESSION_REQUEST_TIMEOUT,
+            )
+        except asyncio.TimeoutError:
+            logger.error(
+                f"Timed out waiting for session {self.session_id} records after {_SESSION_REQUEST_TIMEOUT}s "
+                f"(likely stale HTTP keepalive connection). Returning empty records."
+            )
+            # Still attempt to clean up the session.
+            try:
+                await asyncio.wait_for(
+                    post(self.base_url, {}, action="delete"),
+                    timeout=_SESSION_REQUEST_TIMEOUT,
+                )
+            except Exception:
+                logger.warning(f"Failed to delete session {self.session_id} after timeout")
+            return [], {}
         except Exception as e:
             logger.warning(f"Failed to get session {self.session_id} records: {e}")
             raise
@@ -45,7 +65,10 @@ class OpenAIEndpointTracer:
         metadata = response.metadata
 
         try:
-            await post(f"{self.router_url}/sessions/{self.session_id}", {}, action="delete")
+            await asyncio.wait_for(
+                post(self.base_url, {}, action="delete"),
+                timeout=_SESSION_REQUEST_TIMEOUT,
+            )
         except Exception as e:
             logger.warning(f"Failed to delete session {self.session_id} after collecting records: {e}")
 
