@@ -73,8 +73,10 @@ class MegatronTrainRayActor(TrainRayActor):
 
         unsupported = {"train_actor", "train_log_probs"} & set(args.profile_target)
         if unsupported and args.use_pytorch_profiler:
-            raise NotImplementedError(
-                f"--profile-target {' '.join(sorted(unsupported))} is not supported for Megatron backend"
+            logger.warning(
+                "--profile-target %s: the old iterator-based profiler is not supported for Megatron backend; "
+                "using phase-based profiler instead.",
+                " ".join(sorted(unsupported)),
             )
         self.prof = TrainProfiler(args)
 
@@ -387,13 +389,14 @@ class MegatronTrainRayActor(TrainRayActor):
                 if "ref" in self.weights_backuper.backup_tags:
                     self._set_replay_stage("fallthrough")
                     self._switch_model("ref")
-                    rollout_data.update(
-                        self.compute_log_prob(
-                            data_iterator,
-                            num_microbatches,
-                            store_prefix="ref_",
+                    with self.prof.profile_phase("ref_log_probs", step=rollout_id):
+                        rollout_data.update(
+                            self.compute_log_prob(
+                                data_iterator,
+                                num_microbatches,
+                                store_prefix="ref_",
+                            )
                         )
-                    )
                 self._switch_model("old_actor" if self.args.keep_old_actor else "actor")
                 if not self.args.use_rollout_logprobs or self.args.get_mismatch_metrics:
                     for m in all_replay_managers:
@@ -402,13 +405,14 @@ class MegatronTrainRayActor(TrainRayActor):
                                 m.stage = "replay_forward"
                             else:
                                 m.stage = "record"
-                    rollout_data.update(
-                        self.compute_log_prob(
-                            data_iterator,
-                            num_microbatches,
-                            store_prefix="",
+                    with self.prof.profile_phase("log_probs", step=rollout_id):
+                        rollout_data.update(
+                            self.compute_log_prob(
+                                data_iterator,
+                                num_microbatches,
+                                store_prefix="",
+                            )
                         )
-                    )
                     for m in all_replay_managers:
                         if self._use_rollout_replay(m):
                             m.clear_all_forward()
@@ -434,14 +438,15 @@ class MegatronTrainRayActor(TrainRayActor):
             # Train
             self._set_replay_stage("replay_backward")
             with timer("actor_train"):
-                train(
-                    rollout_id,
-                    self.model,
-                    self.optimizer,
-                    self.opt_param_scheduler,
-                    data_iterator,
-                    num_microbatches,
-                )
+                with self.prof.profile_phase("train_actor", step=rollout_id):
+                    train(
+                        rollout_id,
+                        self.model,
+                        self.optimizer,
+                        self.opt_param_scheduler,
+                        data_iterator,
+                        num_microbatches,
+                    )
 
             self.prof.step(rollout_id=rollout_id)
 
@@ -495,7 +500,7 @@ class MegatronTrainRayActor(TrainRayActor):
             destroy_process_groups()
 
     @timer
-    def update_weights(self) -> None:
+    def update_weights(self, rollout_id: int | None = None) -> None:
         if self.args.debug_train_only or self.args.debug_rollout_only:
             return
 
@@ -511,29 +516,38 @@ class MegatronTrainRayActor(TrainRayActor):
         if self.args.offload_train:
             reload_process_groups()
 
-        if num_new_engines > 0:
-            self.weight_updater.connect_rollout_engines(
-                rollout_engines,
-                rollout_engine_lock,
-                engine_gpu_counts=engine_gpu_counts,
-                engine_gpu_offsets=engine_gpu_offsets,
-            )
-            dist.barrier(group=get_gloo_group())
-            if dist.get_rank() == 0:
-                ray.get(self.rollout_manager.clear_updatable_num_new_engines.remote())
+        profile_ctx = self.prof.profile_phase("update_weights", step=rollout_id) if rollout_id is not None else nullcontext()
+        with profile_ctx:
+            if num_new_engines > 0:
+                self.weight_updater.connect_rollout_engines(
+                    rollout_engines,
+                    rollout_engine_lock,
+                    engine_gpu_counts=engine_gpu_counts,
+                    engine_gpu_offsets=engine_gpu_offsets,
+                )
+                dist.barrier(group=get_gloo_group())
+                if dist.get_rank() == 0:
+                    ray.get(self.rollout_manager.clear_updatable_num_new_engines.remote())
 
-        with torch_memory_saver.disable() if self.args.offload_train else nullcontext():
-            print_memory("before update_weights")
-            self.weight_updater.update_weights()
-            print_memory("after update_weights")
+            if self.args.offload_train and is_lora_enabled(self.args):
+                # For LoRA, we must resume() to restore GPU memory backing for adapter
+                # weights. Unlike base model weights (which are read from CPU backups),
+                # LoRA adapter weights are accessed directly from GPU model parameters.
+                # The disable() context alone only prevents new allocations from being
+                # tracked -- it does NOT restore previously paused/offloaded tensors.
+                torch_memory_saver.resume()
+            with torch_memory_saver.disable() if self.args.offload_train else nullcontext():
+                print_memory("before update_weights")
+                self.weight_updater.update_weights()
+                print_memory("after update_weights")
 
-            if self.args.ci_test and len(rollout_engines) > 0 and not is_lora_enabled(self.args):
-                engine = random.choice(rollout_engines)
-                engine_version = ray.get(engine.get_weight_version.remote())
-                if str(engine_version) != str(self.weight_updater.weight_version):
-                    raise RuntimeError(
-                        f"Weight version mismatch! Engine: {engine_version}, Updater: {self.weight_updater.weight_version}"
-                    )
+                if self.args.ci_test and len(rollout_engines) > 0 and not is_lora_enabled(self.args):
+                    engine = random.choice(rollout_engines)
+                    engine_version = ray.get(engine.get_weight_version.remote())
+                    if str(engine_version) != str(self.weight_updater.weight_version):
+                        raise RuntimeError(
+                            f"Weight version mismatch! Engine: {engine_version}, Updater: {self.weight_updater.weight_version}"
+                        )
 
             if getattr(self.args, "keep_old_actor", False):
                 if self.args.update_weights_interval == 1:

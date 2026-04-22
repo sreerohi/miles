@@ -4,6 +4,7 @@ import logging
 import multiprocessing
 import os
 import time
+from pathlib import Path
 from urllib.parse import quote
 
 import requests
@@ -108,6 +109,12 @@ def _wait_server_healthy(base_url, api_key, is_process_alive):
             time.sleep(2)
 
 
+def is_benign_stop_profile_error(text: str | None) -> bool:
+    text = (text or "").lower()
+    benign_markers = ("not in progress", "not started", "already stopped", "/start_profile first")
+    return any(marker in text for marker in benign_markers)
+
+
 class SGLangEngine(RayActor):
     def __init__(
         self,
@@ -124,6 +131,7 @@ class SGLangEngine(RayActor):
         self.base_gpu_id = base_gpu_id
         self.sglang_overrides = sglang_overrides or {}
         self.num_gpus_per_engine = num_gpus_per_engine
+        self._profile_auto_stop_expected = False
 
     def init(
         self,
@@ -555,6 +563,9 @@ class SGLangEngine(RayActor):
         with_stack: bool | None = None,
         record_shapes: bool | None = None,
     ):
+        if output_dir is not None:
+            Path(output_dir).mkdir(parents=True, exist_ok=True)
+
         response = requests.post(
             f"http://{self.server_host}:{self.server_port}/start_profile",
             json={
@@ -568,11 +579,24 @@ class SGLangEngine(RayActor):
             },
         )
         response.raise_for_status()
+        self._profile_auto_stop_expected = num_steps is not None
         return response
 
     def stop_profile(self):
         response = requests.post(f"http://{self.server_host}:{self.server_port}/stop_profile", json={})
+        if response.status_code == 500 and (
+            is_benign_stop_profile_error(response.text) or self._profile_auto_stop_expected
+        ):
+            logger.warning(
+                "stop_profile: got benign 500 from /stop_profile; ignoring. "
+                "auto_stop_expected=%s response=%s",
+                self._profile_auto_stop_expected,
+                response.text,
+            )
+            self._profile_auto_stop_expected = False
+            return response
         response.raise_for_status()
+        self._profile_auto_stop_expected = False
         return response
 
     def simulate_crash(self):

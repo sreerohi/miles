@@ -1,4 +1,5 @@
 import asyncio
+import logging
 
 from sglang.srt.constants import GPU_MEMORY_TYPE_CUDA_GRAPH, GPU_MEMORY_TYPE_KV_CACHE, GPU_MEMORY_TYPE_WEIGHTS
 
@@ -8,6 +9,8 @@ from miles.utils.async_utils import eager_create_task
 from miles.utils.logging_utils import configure_logger
 from miles.utils.misc import should_run_periodic_action
 from miles.utils.tracking_utils import init_tracking
+
+logger = logging.getLogger(__name__)
 
 
 async def train(args):
@@ -70,7 +73,43 @@ async def train(args):
         if args.eval_interval is not None and rollout_id == 0 and not args.skip_eval_before_train:
             await rollout_manager.eval.remote(rollout_id)
 
-        rollout_data_ref = await rollout_manager.generate.remote(rollout_id)
+        do_rollout_profile = (
+            args.use_rollout_profiler
+            and args.rollout_profile_rollout_start <= rollout_id < args.rollout_profile_rollout_end
+        )
+        if do_rollout_profile:
+            logger.info(
+                "Enable rollout profiler for rollout_id=%s (window=[%s, %s))",
+                rollout_id,
+                args.rollout_profile_rollout_start,
+                args.rollout_profile_rollout_end,
+            )
+            await rollout_manager.start_profile_all.remote(
+                output_dir=args.rollout_profile_output_dir,
+                rollout_id=rollout_id,
+                start_step=args.rollout_profile_start_step,
+                num_steps=args.rollout_profile_num_steps,
+                activities=args.rollout_profile_activities,
+                profile_by_stage=args.rollout_profile_by_stage,
+                with_stack=args.rollout_profile_with_stack,
+                record_shapes=args.rollout_profile_record_shapes,
+            )
+
+        rollout_generate_succeeded = False
+        try:
+            rollout_data_ref = await rollout_manager.generate.remote(rollout_id)
+            rollout_generate_succeeded = True
+        finally:
+            if do_rollout_profile:
+                try:
+                    await rollout_manager.stop_profile_all.remote()
+                except Exception:
+                    if rollout_generate_succeeded:
+                        raise
+                    logger.exception(
+                        "Failed to stop rollout profiler while handling generate failure for rollout_id=%s",
+                        rollout_id,
+                    )
 
         if args.offload_rollout:
             offload_tags = [GPU_MEMORY_TYPE_CUDA_GRAPH]
@@ -94,7 +133,7 @@ async def train(args):
         await offload_train()
         if args.offload_rollout:
             await rollout_manager.onload_weights.remote()
-        await actor_model.update_weights()
+        await actor_model.update_weights(rollout_id)
         if args.offload_rollout:
             await rollout_manager.onload_kv.remote()
 

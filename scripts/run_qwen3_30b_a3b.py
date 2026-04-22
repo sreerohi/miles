@@ -30,6 +30,27 @@ class ScriptArgs(U.ExecuteTrainConfig):
     # TODO improve, should be able to override more easily
     tis_use_rs: bool = True
 
+    # Train profiling (opt-in)
+    enable_train_profile: bool = False
+    train_profile_dir: str = "/workspace/miles/profile_traces/train_traces"
+    train_profile_step_start: int = 1
+    train_profile_step_end: int = 2
+    train_profile_targets: str = "train_actor ref_log_probs log_probs update_weights"
+    train_profile_with_stack: bool = True
+    train_profile_with_shapes: bool = False
+    train_profile_with_memory: bool = False
+
+    # Rollout profiling (opt-in)
+    enable_rollout_profile: bool = False
+    rollout_profile_dir: str = "/workspace/miles/profile_traces/rollout_traces"
+    rollout_profile_rollout_start: int = 1
+    rollout_profile_rollout_end: int = 2
+    rollout_profile_start_step: int = 10
+    rollout_profile_num_steps: int = 50
+    rollout_profile_by_stage: bool = True
+    rollout_profile_with_stack: bool = True
+    rollout_profile_record_shapes: bool = True
+
     def __post_init__(self):
         self.num_gpus_per_node = self.num_gpus_per_node or U.NUM_GPUS_OF_HARDWARE[self.hardware]
         if self.rollout_int4:
@@ -293,6 +314,39 @@ tis_batch_normalize: true
             "--custom-tis-function-path examples.train_infer_mismatch_helper.mis.compute_mis_weights_with_cp "
         )
 
+    # Profiling (opt-in)
+    profile_args = ""
+    if args.enable_train_profile:
+        profile_args += (
+            "--use-pytorch-profiler "
+            f"--profile-step-start {args.train_profile_step_start} "
+            f"--profile-step-end {args.train_profile_step_end} "
+            f"--tensorboard-dir {args.train_profile_dir} "
+            f"--profile-target {args.train_profile_targets} "
+        )
+        if args.train_profile_with_stack:
+            profile_args += "--profile-with-stack "
+        if args.train_profile_with_shapes:
+            profile_args += "--profile-with-shapes "
+        if args.train_profile_with_memory:
+            profile_args += "--profile-with-memory "
+
+    if args.enable_rollout_profile:
+        profile_args += (
+            "--use-rollout-profiler "
+            f"--rollout-profile-rollout-start {args.rollout_profile_rollout_start} "
+            f"--rollout-profile-rollout-end {args.rollout_profile_rollout_end} "
+            f"--rollout-profile-output-dir {args.rollout_profile_dir} "
+            f"--rollout-profile-start-step {args.rollout_profile_start_step} "
+            f"--rollout-profile-num-steps {args.rollout_profile_num_steps} "
+        )
+        if args.rollout_profile_by_stage:
+            profile_args += "--rollout-profile-by-stage "
+        if args.rollout_profile_with_stack:
+            profile_args += "--rollout-profile-with-stack "
+        if args.rollout_profile_record_shapes:
+            profile_args += "--rollout-profile-record-shapes "
+
     train_args = (
         f"{ckpt_args} "
         f"{rollout_args} "
@@ -303,6 +357,7 @@ tis_batch_normalize: true
         f"{eval_args} "
         f"{sglang_args} "
         f"{misc_args} "
+        f"{profile_args} "
         f"{args.extra_args} "
     )
 

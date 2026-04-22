@@ -1,6 +1,7 @@
 import logging
 import time
 import traceback
+from contextlib import contextmanager
 from pathlib import Path
 
 import torch
@@ -14,6 +15,7 @@ class TrainProfiler:
     def __init__(self, args):
         self.args = args
         self._torch_profiler_overall = None
+        self._phase_counters = {}
         self._memory_profiler_overall = None
 
         if args.use_pytorch_profiler and ("train_overall" in args.profile_target):
@@ -38,6 +40,25 @@ class TrainProfiler:
         ):
             self._memory_profiler_overall.stop()
 
+    @contextmanager
+    def profile_phase(self, name: str, step: int | None = None):
+        if not (self.args.use_pytorch_profiler and name in self.args.profile_target):
+            yield
+            return
+
+        if step is None:
+            counter = self._phase_counters.get(name, 0)
+            self._phase_counters[name] = counter + 1
+            should_profile = self.args.profile_step_start <= counter < self.args.profile_step_end
+        else:
+            should_profile = self.args.profile_step_start <= step < self.args.profile_step_end
+
+        if should_profile:
+            with _create_phase_profiler(self.args, name):
+                yield
+        else:
+            yield
+
     def iterate_train_actor(self, iterator):
         return _profile_simple_loop(iterator, self.args, name="train_actor")
 
@@ -57,6 +78,27 @@ def _profile_simple_loop(iterator, args, name):
         torch_profiler.step()
 
 
+@contextmanager
+def _create_phase_profiler(args, name):
+    """Profile a single phase block and flush it immediately on exit."""
+    trace_handler = torch.profiler.tensorboard_trace_handler(
+        args.tensorboard_dir,
+        worker_name=f"{name}_rank_{torch.distributed.get_rank()}",
+        use_gzip=True,
+    )
+    prof = torch.profiler.profile(
+        record_shapes=getattr(args, "profile_with_shapes", False),
+        with_stack=getattr(args, "profile_with_stack", False),
+        profile_memory=getattr(args, "profile_with_memory", False),
+        with_flops=True,
+    )
+    try:
+        with prof:
+            yield prof
+    finally:
+        trace_handler(prof)
+
+
 def _create_torch_profiler(args, name):
     return torch.profiler.profile(
         schedule=torch.profiler.schedule(
@@ -71,9 +113,9 @@ def _create_torch_profiler(args, name):
             worker_name=f"{name}_rank_{torch.distributed.get_rank()}",
             use_gzip=True,
         ),
-        record_shapes=True,
-        with_stack=True,
-        profile_memory=True,
+        record_shapes=getattr(args, "profile_with_shapes", False),
+        with_stack=getattr(args, "profile_with_stack", False),
+        profile_memory=getattr(args, "profile_with_memory", False),
         with_flops=True,
     )
 
