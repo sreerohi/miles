@@ -72,4 +72,11 @@ jobs:
         run: cd $GITHUB_WORKSPACE && pip install -e . --no-deps --break-system-packages
       - name: Execute
         shell: bash
-        run: python tests/ci/gpu_lock_exec.py --count ${{ matrix.info.num_gpus }} -- pytest tests/${{ matrix.info.test_file }}
+        run: python tests/ci/gpu_lock_exec.py --count ${{ matrix.info.num_gpus }} -- pytest tests/${{ matrix.info.test_file }} --junitxml=results.xml
+      - name: Test Report
+        uses: dorny/test-reporter@v1
+        if: always()
+        with:
+          name: Test Results (ROCm MI350)
+          path: results.xml
+          reporter: java-junit
