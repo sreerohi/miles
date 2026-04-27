@@ -1,4 +1,4 @@
-name: PR Test (ROCm MI300X)
+name: PR Test (ROCm)
 
 on:
   pull_request:
