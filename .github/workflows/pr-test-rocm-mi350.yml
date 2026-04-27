@@ -73,6 +73,9 @@ jobs:
       - name: Execute
         shell: bash
         run: python tests/ci/gpu_lock_exec.py --count ${{ matrix.info.num_gpus }} -- pytest tests/${{ matrix.info.test_file }} --junitxml=results.xml
+      - name: Fix git ownership
+        if: always()
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
       - name: Test Report
         uses: dorny/test-reporter@v1
         if: always()
