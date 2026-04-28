@@ -1,4 +1,4 @@
-name: PR Test (ROCm MI300X)
+name: PR Test (ROCm MI350)
 
 on:
   pull_request:
@@ -16,12 +16,16 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
+permissions:
+  checks: write
+  contents: read
+
 jobs:
   fast:
     if: (github.event_name == 'workflow_dispatch') || (github.event.pull_request)
-    runs-on: [self-hosted, rocm, mi300x]
+    runs-on: [self-hosted, rocm, mi350]
     container:
-      image: rlsys/miles:rocm7-mi300-sglang0.5.9-te2.10.0-dev-307b5e86
+      image: rlsys/miles:MI350-355-latest
       options: >
         --device=/dev/kfd
         --device=/dev/dri
@@ -72,4 +76,14 @@ jobs:
         run: cd $GITHUB_WORKSPACE && pip install -e . --no-deps --break-system-packages
       - name: Execute
         shell: bash
-        run: python tests/ci/gpu_lock_exec.py --count ${{ matrix.info.num_gpus }} -- pytest tests/${{ matrix.info.test_file }}
+        run: python tests/ci/gpu_lock_exec.py --count ${{ matrix.info.num_gpus }} -- pytest tests/${{ matrix.info.test_file }} --junitxml=results.xml
+      - name: Fix git ownership
+        if: always()
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+      - name: Test Report
+        uses: dorny/test-reporter@v1
+        if: always()
+        with:
+          name: Test Results (ROCm MI350)
+          path: results.xml
+          reporter: java-junit
